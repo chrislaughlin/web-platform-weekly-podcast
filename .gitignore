@@ -4,3 +4,4 @@ dist/
 data/*.json
 data/artifacts/
 *.log
+.DS_Store
