@@ -1,7 +1,9 @@
 import "dotenv/config";
 import crypto from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
 import sharp from "sharp";
@@ -10,6 +12,7 @@ import { listRuns, saveRun } from "./store.js";
 import type { Article, NewsletterIssue, PodcastScript, Run, SourceId } from "./types.js";
 
 const artifactDir = path.resolve(process.env.DATA_DIR ?? "./data", "artifacts");
+const execFileAsync = promisify(execFile);
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: Number(process.env.OPENAI_TIMEOUT_MS ?? 120000),
@@ -93,6 +96,40 @@ export function renderPodcastNarration(script: PodcastScript): string {
   return [opening, segments].filter(Boolean).join("\n\n");
 }
 
+function splitText(text: string, maxCharacters: number): string[] {
+  const paragraphs = text.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let current = "";
+  for (const paragraph of paragraphs) {
+    if (paragraph.length > maxCharacters) {
+      if (current) chunks.push(current), current = "";
+      let remaining = paragraph;
+      while (remaining.length > maxCharacters) {
+        const boundary = remaining.lastIndexOf(" ", maxCharacters);
+        const cut = boundary > Math.floor(maxCharacters * 0.6) ? boundary : maxCharacters;
+        chunks.push(remaining.slice(0, cut).trim());
+        remaining = remaining.slice(cut).trim();
+      }
+      if (remaining) chunks.push(remaining);
+      continue;
+    }
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (candidate.length > maxCharacters) {
+      chunks.push(current);
+      current = paragraph;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+export function speechChunks(script: PodcastScript, maxCharacters: number): string[] {
+  return [script.narration, ...script.segments.map((segment) => `${segment.title.trim()}\n\n${segment.narration.trim()}`)]
+    .flatMap((text) => splitText(text, maxCharacters));
+}
+
 async function generateScript(issue: NewsletterIssue): Promise<PodcastScript> {
   if (!openai) throw new Error("OPENAI_API_KEY is required to generate a script");
   const model = process.env.OPENAI_TEXT_MODEL ?? "gpt-5";
@@ -125,48 +162,65 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
   const apiKey = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   if (!apiKey || !voiceId) throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required to generate audio");
-  const narration = renderPodcastNarration(script);
   const configuredModel = process.env.ELEVENLABS_MODEL;
-  const model = selectElevenLabsModel(configuredModel, narration.length);
-  if (!configuredModel && model !== "eleven_multilingual_v2") {
-    logger.warn("audio.model-fallback", { runId, fromModel: "eleven_multilingual_v2", toModel: model, narrationCharacters: narration.length, configuredLimit: 10000 });
-  }
-  logger.info("audio.requested", { runId, provider: "elevenlabs", model, voiceConfigured: Boolean(voiceId), narrationCharacters: narration.length, segmentCount: script.segments.length });
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
-    method: "POST",
-    headers: { "xi-api-key": apiKey, "content-type": "application/json" },
-    body: JSON.stringify({ text: narration, model_id: model })
-  });
-  logger.info("audio.responded", { runId, provider: "elevenlabs", status: response.status, contentType: response.headers.get("content-type") });
-  if (!response.ok) {
-    const errorBody = await response.text();
-    let providerMessage = errorBody.slice(0, 500);
-    try {
-      const parsed = JSON.parse(errorBody) as { detail?: { status?: string; message?: string } };
-      providerMessage = parsed.detail?.message || parsed.detail?.status || providerMessage;
-    } catch {
-      // Preserve the HTTP error even if the provider sends a non-JSON response.
+  const model = configuredModel ?? "eleven_multilingual_v2";
+  const modelLimit = speechModelLimits[model] ?? 10000;
+  const maxChunkCharacters = Math.max(1000, modelLimit - 500);
+  const chunks = speechChunks(script, maxChunkCharacters);
+  const temporaryDir = await mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "web-platform-weekly-audio-"));
+  const chunkPaths: string[] = [];
+  logger.info("audio.requested", { runId, provider: "elevenlabs", model, voiceConfigured: Boolean(voiceId), narrationCharacters: renderPodcastNarration(script).length, segmentCount: script.segments.length, chunkCount: chunks.length, maxChunkCharacters });
+  try {
+    for (const [index, text] of chunks.entries()) {
+      const previousText = chunks[index - 1]?.slice(-500);
+      const nextText = chunks[index + 1]?.slice(0, 500);
+      logger.info("audio.chunk.requested", { runId, chunkIndex: index, chunkCount: chunks.length, model, characters: text.length });
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+        method: "POST",
+        headers: { "xi-api-key": apiKey, "content-type": "application/json" },
+        body: JSON.stringify({ text, model_id: model, previous_text: previousText, next_text: nextText })
+      });
+      logger.info("audio.chunk.responded", { runId, chunkIndex: index, chunkCount: chunks.length, provider: "elevenlabs", status: response.status, contentType: response.headers.get("content-type") });
+      if (!response.ok) {
+        const errorBody = await response.text();
+        let providerMessage = errorBody.slice(0, 500);
+        try {
+          const parsed = JSON.parse(errorBody) as { detail?: { status?: string; message?: string } };
+          providerMessage = parsed.detail?.message || parsed.detail?.status || providerMessage;
+        } catch {
+          // Preserve the HTTP error even if the provider sends a non-JSON response.
+        }
+        logger.error("audio.provider-failed", { runId, chunkIndex: index, chunkCount: chunks.length, provider: "elevenlabs", status: response.status, model, providerMessage });
+        throw new Error(`ElevenLabs failed on chunk ${index + 1}/${chunks.length} (${response.status}): ${providerMessage}`);
+      }
+      const chunkPath = path.join(temporaryDir, `chunk-${String(index).padStart(3, "0")}.mp3`);
+      const audio = Buffer.from(await response.arrayBuffer());
+      await writeFile(chunkPath, audio);
+      chunkPaths.push(chunkPath);
+      logger.info("audio.chunk.saved", { runId, chunkIndex: index, chunkCount: chunks.length, bytes: audio.byteLength });
     }
-    logger.error("audio.provider-failed", { runId, provider: "elevenlabs", status: response.status, model, providerMessage });
-    throw new Error(`ElevenLabs failed (${response.status}): ${providerMessage}`);
+    const concatList = path.join(temporaryDir, "concat.txt");
+    await writeFile(concatList, chunkPaths.map((chunkPath) => `file '${chunkPath.replaceAll("'", "'\\''")}'`).join("\n"));
+    const filePath = path.join(artifactDir, `${runId}.mp3`);
+    await execFileAsync(process.env.FFMPEG_PATH ?? "ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatList, "-ar", "44100", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "128k", filePath]);
+    logger.info("audio.saved", { runId, filePath, chunkCount: chunks.length });
+    return filePath;
+  } finally {
+    await rm(temporaryDir, { recursive: true, force: true });
   }
-  const filePath = path.join(artifactDir, `${runId}.mp3`);
-  const audio = Buffer.from(await response.arrayBuffer());
-  await writeFile(filePath, audio);
-  logger.info("audio.saved", { runId, filePath, bytes: audio.byteLength });
-  return filePath;
 }
+
+const speechModelLimits: Record<string, number> = {
+  eleven_v3: 5000,
+  eleven_multilingual_v1: 10000,
+  eleven_multilingual_v2: 10000,
+  eleven_flash_v2: 30000,
+  eleven_flash_v2_5: 40000
+};
 
 export function selectElevenLabsModel(configuredModel: string | undefined, narrationCharacters: number): string {
   const requestedModel = configuredModel ?? "eleven_multilingual_v2";
-  const modelLimits: Record<string, number> = {
-    eleven_v3: 5000,
-    eleven_multilingual_v1: 10000,
-    eleven_multilingual_v2: 10000,
-    eleven_flash_v2: 30000,
-    eleven_flash_v2_5: 40000
-  };
-  const requestedLimit = modelLimits[requestedModel];
+  const requestedLimit = speechModelLimits[requestedModel];
   if (requestedLimit && narrationCharacters > requestedLimit) {
     if (configuredModel) {
       throw new Error(`ElevenLabs model ${requestedModel} supports ${requestedLimit} characters, but this script has ${narrationCharacters}. Set ELEVENLABS_MODEL=eleven_flash_v2_5 or shorten the script.`);

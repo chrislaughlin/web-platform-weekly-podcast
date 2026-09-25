@@ -29,6 +29,7 @@ Required keys:
 - `ELEVENLABS_API_KEY`: narration generation.
 - `ELEVENLABS_VOICE_ID`: the ElevenLabs voice to use.
 - `ELEVENLABS_MODEL`: optional voice model; defaults to `eleven_multilingual_v2`. Scripts over that model's 10,000-character limit automatically fall back to `eleven_flash_v2_5` unless you explicitly set a different model.
+- `FFMPEG_PATH`: optional FFmpeg executable path; defaults to `ffmpeg`. Audio is generated in chunks and joined locally to keep voice delivery consistent across longer episodes.
 
 Optional settings are documented in `.env.example`.
 
