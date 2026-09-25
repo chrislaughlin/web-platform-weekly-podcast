@@ -126,19 +126,54 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   if (!apiKey || !voiceId) throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required to generate audio");
   const narration = renderPodcastNarration(script);
-  logger.info("audio.requested", { runId, provider: "elevenlabs", model: "eleven_multilingual_v2", voiceConfigured: Boolean(voiceId), narrationCharacters: narration.length, segmentCount: script.segments.length });
+  const configuredModel = process.env.ELEVENLABS_MODEL;
+  const model = selectElevenLabsModel(configuredModel, narration.length);
+  if (!configuredModel && model !== "eleven_multilingual_v2") {
+    logger.warn("audio.model-fallback", { runId, fromModel: "eleven_multilingual_v2", toModel: model, narrationCharacters: narration.length, configuredLimit: 10000 });
+  }
+  logger.info("audio.requested", { runId, provider: "elevenlabs", model, voiceConfigured: Boolean(voiceId), narrationCharacters: narration.length, segmentCount: script.segments.length });
   const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
     method: "POST",
     headers: { "xi-api-key": apiKey, "content-type": "application/json" },
-    body: JSON.stringify({ text: narration, model_id: "eleven_multilingual_v2" })
+    body: JSON.stringify({ text: narration, model_id: model })
   });
   logger.info("audio.responded", { runId, provider: "elevenlabs", status: response.status, contentType: response.headers.get("content-type") });
-  if (!response.ok) throw new Error(`ElevenLabs failed (${response.status})`);
+  if (!response.ok) {
+    const errorBody = await response.text();
+    let providerMessage = errorBody.slice(0, 500);
+    try {
+      const parsed = JSON.parse(errorBody) as { detail?: { status?: string; message?: string } };
+      providerMessage = parsed.detail?.message || parsed.detail?.status || providerMessage;
+    } catch {
+      // Preserve the HTTP error even if the provider sends a non-JSON response.
+    }
+    logger.error("audio.provider-failed", { runId, provider: "elevenlabs", status: response.status, model, providerMessage });
+    throw new Error(`ElevenLabs failed (${response.status}): ${providerMessage}`);
+  }
   const filePath = path.join(artifactDir, `${runId}.mp3`);
   const audio = Buffer.from(await response.arrayBuffer());
   await writeFile(filePath, audio);
   logger.info("audio.saved", { runId, filePath, bytes: audio.byteLength });
   return filePath;
+}
+
+export function selectElevenLabsModel(configuredModel: string | undefined, narrationCharacters: number): string {
+  const requestedModel = configuredModel ?? "eleven_multilingual_v2";
+  const modelLimits: Record<string, number> = {
+    eleven_v3: 5000,
+    eleven_multilingual_v1: 10000,
+    eleven_multilingual_v2: 10000,
+    eleven_flash_v2: 30000,
+    eleven_flash_v2_5: 40000
+  };
+  const requestedLimit = modelLimits[requestedModel];
+  if (requestedLimit && narrationCharacters > requestedLimit) {
+    if (configuredModel) {
+      throw new Error(`ElevenLabs model ${requestedModel} supports ${requestedLimit} characters, but this script has ${narrationCharacters}. Set ELEVENLABS_MODEL=eleven_flash_v2_5 or shorten the script.`);
+    }
+    return "eleven_flash_v2_5";
+  }
+  return requestedModel;
 }
 
 async function generateCover(runId: string, issue: NewsletterIssue): Promise<string> {
