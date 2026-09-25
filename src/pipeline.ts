@@ -84,6 +84,15 @@ function extractJson(text: string): string {
   return (fenced ?? text).trim();
 }
 
+export function renderPodcastNarration(script: PodcastScript): string {
+  const opening = script.narration.trim();
+  const segments = script.segments
+    .map((segment) => `${segment.title.trim()}\n\n${segment.narration.trim()}`)
+    .filter(Boolean)
+    .join("\n\n");
+  return [opening, segments].filter(Boolean).join("\n\n");
+}
+
 async function generateScript(issue: NewsletterIssue): Promise<PodcastScript> {
   if (!openai) throw new Error("OPENAI_API_KEY is required to generate a script");
   const model = process.env.OPENAI_TEXT_MODEL ?? "gpt-5";
@@ -107,7 +116,8 @@ Issue: ${JSON.stringify(issue)}`;
     throw error;
   }
   const script = JSON.parse(extractJson(response.output_text)) as PodcastScript;
-  logger.info("script.generated", { model, title: script.title, segmentCount: script.segments.length, narrationCharacters: script.narration.length });
+  const renderedNarration = renderPodcastNarration(script);
+  logger.info("script.generated", { model, title: script.title, segmentCount: script.segments.length, openingCharacters: script.narration.length, renderedNarrationCharacters: renderedNarration.length });
   return script;
 }
 
@@ -115,11 +125,12 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
   const apiKey = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   if (!apiKey || !voiceId) throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required to generate audio");
-  logger.info("audio.requested", { runId, provider: "elevenlabs", model: "eleven_multilingual_v2", voiceConfigured: Boolean(voiceId), narrationCharacters: script.narration.length });
+  const narration = renderPodcastNarration(script);
+  logger.info("audio.requested", { runId, provider: "elevenlabs", model: "eleven_multilingual_v2", voiceConfigured: Boolean(voiceId), narrationCharacters: narration.length, segmentCount: script.segments.length });
   const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
     method: "POST",
     headers: { "xi-api-key": apiKey, "content-type": "application/json" },
-    body: JSON.stringify({ text: script.narration, model_id: "eleven_multilingual_v2" })
+    body: JSON.stringify({ text: narration, model_id: "eleven_multilingual_v2" })
   });
   logger.info("audio.responded", { runId, provider: "elevenlabs", status: response.status, contentType: response.headers.get("content-type") });
   if (!response.ok) throw new Error(`ElevenLabs failed (${response.status})`);
