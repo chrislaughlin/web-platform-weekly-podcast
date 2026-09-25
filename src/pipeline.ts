@@ -1,0 +1,151 @@
+import "dotenv/config";
+import crypto from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import * as cheerio from "cheerio";
+import OpenAI from "openai";
+import sharp from "sharp";
+import { listRuns, saveRun } from "./store.js";
+import type { Article, NewsletterIssue, PodcastScript, Run, SourceId } from "./types.js";
+
+const artifactDir = path.resolve(process.env.DATA_DIR ?? "./data", "artifacts");
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : undefined;
+
+const defaults: Record<SourceId, string> = {
+  "javascript-weekly": "https://javascriptweekly.com/",
+  "this-week-in-react": "https://thisweekinreact.com/newsletter"
+};
+
+function hash(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) url.searchParams.delete(key);
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return value.trim();
+  }
+}
+
+function clean(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function resolveUrl(source: SourceId, requestedUrl?: string, issueNumber?: string): string {
+  if (requestedUrl) return requestedUrl;
+  if (source === "javascript-weekly" && issueNumber) return `https://javascriptweekly.com/issues/${issueNumber}`;
+  return defaults[source];
+}
+
+export async function fetchIssue(source: SourceId, requestedUrl?: string, issueNumber?: string): Promise<NewsletterIssue> {
+  const url = resolveUrl(source, requestedUrl, issueNumber);
+  const response = await fetch(url, { headers: { "user-agent": "web-platform-weekly-podcast/0.1" } });
+  if (!response.ok) throw new Error(`Could not fetch newsletter (${response.status}): ${url}`);
+  const html = await response.text();
+  const $ = cheerio.load(html);
+  const title = clean($("h1").first().text() || $("title").text() || source);
+  const issueText = clean($("body").text()).match(/#(\d{2,4})/)?.[1] ?? issueNumber;
+  const publishedAt = clean($("time").first().attr("datetime") || $("time").first().text()) || undefined;
+  const articles: Article[] = [];
+  const seen = new Set<string>();
+  $(".mainlink a, p.desc a, h2 a, h3 a, article a").each((_, element) => {
+    const node = $(element);
+    const heading = clean(node.is("a") ? node.text() : node.find("a").first().text() || node.text());
+    const href = node.is("a") ? node.attr("href") : node.find("a").first().attr("href");
+    if (!heading || heading.length < 12 || !href) return;
+    let absolute: string;
+    try { absolute = new URL(href, url).toString(); } catch { return; }
+    const normalized = canonicalUrl(absolute);
+    if (normalized.includes("javascriptweekly.com/issues") || normalized.includes("thisweekinreact.com/newsletter")) return;
+    const fingerprint = hash(`${heading.toLowerCase()}|${normalized}`);
+    if (seen.has(fingerprint)) return;
+    seen.add(fingerprint);
+    articles.push({ title: heading, url: absolute, summary: clean(node.parent().text()).slice(0, 500), fingerprint });
+  });
+  if (!articles.length) throw new Error(`No articles found at ${url}`);
+  return { source, issueNumber: issueText, title, publishedAt, url, contentHash: hash(html), articles: articles.slice(0, 40) };
+}
+
+function extractJson(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  return (fenced ?? text).trim();
+}
+
+async function generateScript(issue: NewsletterIssue): Promise<PodcastScript> {
+  if (!openai) throw new Error("OPENAI_API_KEY is required to generate a script");
+  const input = `You are the editor and host of a concise weekly podcast for JavaScript and React developers.
+Create an original, flowing 8-12 minute episode from this newsletter issue. Select the strongest stories, explain why they matter, and use natural transitions. Do not invent facts or copy newsletter prose. Preserve source URLs in the JSON. Return JSON only with keys title, description, narration, segments; each segment has title, sourceUrl, narration.
+
+Issue: ${JSON.stringify(issue)}`;
+  const response = await openai.responses.create({ model: process.env.OPENAI_TEXT_MODEL ?? "gpt-5", input });
+  return JSON.parse(extractJson(response.output_text)) as PodcastScript;
+}
+
+async function generateAudio(runId: string, script: PodcastScript): Promise<string> {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  if (!apiKey || !voiceId) throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required to generate audio");
+  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+    method: "POST",
+    headers: { "xi-api-key": apiKey, "content-type": "application/json" },
+    body: JSON.stringify({ text: script.narration, model_id: "eleven_multilingual_v2" })
+  });
+  if (!response.ok) throw new Error(`ElevenLabs failed (${response.status}): ${await response.text()}`);
+  const filePath = path.join(artifactDir, `${runId}.mp3`);
+  await writeFile(filePath, Buffer.from(await response.arrayBuffer()));
+  return filePath;
+}
+
+async function generateCover(runId: string, issue: NewsletterIssue): Promise<string> {
+  if (!openai) throw new Error("OPENAI_API_KEY is required to generate cover art");
+  const headlineList = issue.articles.slice(0, 8).map((article) => article.title).join("; ");
+  const result = await openai.images.generate({
+    model: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-2.5-flare",
+    prompt: `Square editorial podcast cover art about JavaScript, React, web engineering, and developer tools. Use an energetic modern illustration with browser windows, component graphs, and signal waves. No words, letters, logos, or brand marks. Themes from this week's headlines: ${headlineList}`,
+    size: "1024x1024",
+    output_format: "png"
+  });
+  const encoded = result.data?.[0]?.b64_json;
+  if (!encoded) throw new Error("OpenAI returned no cover image");
+  const label = `<svg width="1024" height="1024"><style>text{font-family:Arial,sans-serif;fill:white} .small{font-size:34px;font-weight:bold;letter-spacing:4px} .large{font-size:74px;font-weight:800}</style><text x="64" y="860" class="small">THE WEB PLATFORM WEEKLY</text><text x="64" y="940" class="large">${escapeXml(issue.issueNumber ? `ISSUE ${issue.issueNumber}` : "WEEKLY")}</text></svg>`;
+  const filePath = path.join(artifactDir, `${runId}.png`);
+  await sharp(Buffer.from(encoded, "base64")).composite([{ input: Buffer.from(label), blend: "over" }]).png().toFile(filePath);
+  return filePath;
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[<>&'\"]/g, (character) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[character] ?? character));
+}
+
+export async function executeRun(input: { source: SourceId; requestedUrl?: string; issueNumber?: string; bypass?: boolean }): Promise<Run> {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const run: Run = { id, source: input.source, requestedUrl: input.requestedUrl, requestedIssueNumber: input.issueNumber, bypass: input.bypass === true, status: "running", createdAt: now, updatedAt: now };
+  await saveRun(run);
+  try {
+    await mkdir(artifactDir, { recursive: true });
+    const issue = await fetchIssue(input.source, input.requestedUrl, input.issueNumber);
+    run.issue = issue;
+    const previous = await listRuns();
+    const duplicate = previous.find((item) => item.id !== id && item.status === "completed" && item.issue?.contentHash === issue.contentHash);
+    if (duplicate && !run.bypass) throw new Error(`This issue was already processed in run ${duplicate.id}. Re-run with bypass enabled for testing.`);
+    const script = await generateScript(issue);
+    run.script = script;
+    run.audioPath = await generateAudio(id, script);
+    run.coverPath = await generateCover(id, issue);
+    run.status = "completed";
+    run.updatedAt = new Date().toISOString();
+    await saveRun(run);
+    return run;
+  } catch (error) {
+    run.status = "failed";
+    run.error = error instanceof Error ? error.message : String(error);
+    run.updatedAt = new Date().toISOString();
+    await saveRun(run);
+    return run;
+  }
+}
