@@ -5,12 +5,16 @@ import path from "node:path";
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
 import sharp from "sharp";
-import { errorDetails, loggedStage, logger } from "./logger.js";
+import { causeDetails, errorDetails, loggedStage, logger } from "./logger.js";
 import { listRuns, saveRun } from "./store.js";
 import type { Article, NewsletterIssue, PodcastScript, Run, SourceId } from "./types.js";
 
 const artifactDir = path.resolve(process.env.DATA_DIR ?? "./data", "artifacts");
-const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : undefined;
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  timeout: Number(process.env.OPENAI_TIMEOUT_MS ?? 120000),
+  maxRetries: Number(process.env.OPENAI_MAX_RETRIES ?? 1)
+}) : undefined;
 
 const defaults: Record<SourceId, string> = {
   "javascript-weekly": "https://javascriptweekly.com/",
@@ -88,7 +92,20 @@ async function generateScript(issue: NewsletterIssue): Promise<PodcastScript> {
 Create an original, flowing 8-12 minute episode from this newsletter issue. Select the strongest stories, explain why they matter, and use natural transitions. Do not invent facts or copy newsletter prose. Preserve source URLs in the JSON. Return JSON only with keys title, description, narration, segments; each segment has title, sourceUrl, narration.
 
 Issue: ${JSON.stringify(issue)}`;
-  const response = await openai.responses.create({ model, input });
+  let response;
+  try {
+    response = await openai.responses.create({ model, input });
+  } catch (error) {
+    logger.error("script.openai.failed", { model, ...errorDetails(error), ...causeDetails(error) });
+    if (error instanceof OpenAI.APIConnectionError) {
+      const cause = error.cause instanceof Error ? `: ${error.cause.message}` : "";
+      throw new Error(`OpenAI connection failed${cause}. Check network, proxy, TLS, or firewall settings.`);
+    }
+    if (error instanceof OpenAI.APIError) {
+      throw new Error(`OpenAI API failed (${error.status ?? "unknown status"}): ${error.message}`);
+    }
+    throw error;
+  }
   const script = JSON.parse(extractJson(response.output_text)) as PodcastScript;
   logger.info("script.generated", { model, title: script.title, segmentCount: script.segments.length, narrationCharacters: script.narration.length });
   return script;

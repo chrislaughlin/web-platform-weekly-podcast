@@ -31,6 +31,14 @@ export function errorDetails(error: unknown): { errorName: string; errorMessage:
     : { errorName: "UnknownError", errorMessage: String(error) };
 }
 
+export function causeDetails(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) return {};
+  const cause = error.cause;
+  if (cause instanceof Error) return { causeName: cause.name, causeMessage: cause.message };
+  if (cause) return { cause: String(cause) };
+  return {};
+}
+
 export async function loggedStage<T>(runId: string, stage: string, operation: () => Promise<T>, context: LogContext = {}): Promise<T> {
   const startedAt = Date.now();
   logger.info("stage.started", { runId, stage, ...context });

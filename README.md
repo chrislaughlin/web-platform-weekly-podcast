@@ -31,6 +31,13 @@ Required keys:
 
 Optional settings are documented in `.env.example`.
 
+OpenAI transport settings:
+
+- `OPENAI_TIMEOUT_MS` defaults to `120000` (two minutes).
+- `OPENAI_MAX_RETRIES` defaults to `1`.
+
+If a script run fails with an OpenAI connection error, inspect the `script.openai.failed` log event. It reports whether the failure was a timeout, DNS/TLS/transport error, or an API response error without printing the API key.
+
 ## Bypass testing
 
 The bypass option deliberately ignores duplicate rejection while retaining the same input and artifact recording. Use the UI checkbox or:
