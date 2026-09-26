@@ -1,18 +1,28 @@
-# Web Platform Weekly Podcast
+# Web Platform Weekly Podcast 🎙️✨
 
-Local TypeScript MVP that turns JavaScript Weekly or This Week in React into a generated podcast episode and cover image.
+Turn a stack of web-dev newsletters into a ready-to-review podcast episode — complete with a script, smooth narration, and fresh cover art.
 
-## What it does
+This is a local TypeScript MVP for transforming JavaScript Weekly or This Week in React into something you can listen to instead of merely bookmarking.
 
-- Fetches a specific issue URL, JavaScript Weekly issue number, or the latest archive page.
-- Extracts and fingerprints article links.
+## The vibe
+
+```text
+newsletter links → article fingerprints → podcast script → MP3 + cover art
+```
+
+The pipeline:
+
+- Fetches one or more specific issue URLs, a JavaScript Weekly issue number, or the latest archive page.
+- Extracts and fingerprints article links so repeat runs can be spotted.
 - Generates an original podcast script with OpenAI.
 - Generates MP3 narration with ElevenLabs.
-- Generates square cover art with OpenAI and adds deterministic episode text.
-- Persists run history and artifacts under `data/`.
-- Supports bypass runs with `bypass: true` or the CLI `--bypass` flag.
+- Generates square cover art with OpenAI using keywords extracted from the finished script.
+- Saves a tidy, inspectable run history under `data/artifacts/<run-id>/`: `script/`, `sources/`, `audio/`, and `cover-art/`.
+- Supports bypass runs with `bypass: true` or the CLI `--bypass` flag when you want to rerun the same ingredients.
 
-## Setup
+No mystery meat, no external database, no giant platform to wrestle: just articles in, audio out.
+
+## Get it humming
 
 ```bash
 npm install
@@ -33,6 +43,23 @@ Required keys:
 
 Optional settings are documented in `.env.example`.
 
+## Make an episode from the terminal
+
+```bash
+npm run run -- --source javascript-weekly --issue 803
+npm run run -- --source this-week-in-react --url https://thisweekinreact.com/newsletter/298
+```
+
+For an exact issue, prefer `--url`; newsletter URL formats can change. You can also feed in multiple issues in one run:
+
+```bash
+npm run run -- \
+  --source javascript-weekly \
+  --url https://javascriptweekly.com/issues/803 \
+  --url https://javascriptweekly.com/issues/802 \
+  --bypass
+```
+
 OpenAI transport settings:
 
 - `OPENAI_TIMEOUT_MS` defaults to `120000` (two minutes).
@@ -40,21 +67,20 @@ OpenAI transport settings:
 
 If a script run fails with an OpenAI connection error, inspect the `script.openai.failed` log event. It reports whether the failure was a timeout, DNS/TLS/transport error, or an API response error without printing the API key.
 
-## Bypass testing
+## Bypass mode: second takes welcome
 
 The bypass option deliberately ignores duplicate rejection while retaining the same input and artifact recording. Use the UI checkbox or:
 
 ```bash
 npm run run -- --source javascript-weekly --issue 803 --bypass
 npm run run -- --source this-week-in-react --url https://thisweekinreact.com/newsletter/298 --bypass
+npm run run -- --source javascript-weekly --url https://javascriptweekly.com/issues/803 --url https://javascriptweekly.com/issues/802 --bypass
 ```
-
-For an exact issue, prefer `--url`; issue-number URL formats can differ between newsletters.
 
 ## Docker
 
-The app is intentionally file-backed for the first MVP, so it can run in a single container. Add a small Node 22 Alpine Dockerfile and Compose file once the provider flow is stable; the application itself has no external database requirement yet.
+The app is intentionally file-backed, so it can run in a single container. The included Docker files are ready for the next step once the provider flow is stable; the application itself has no external database requirement.
 
-## Current publishing boundary
+## Where the beat stops
 
-This MVP stops at local audio, cover art, script, and source metadata. Publishing should be added through a podcast host/RSS adapter after manual review. Spotify for Creators currently supports uploading through its creator interface, but a general public upload API should not be assumed.
+This MVP stops at local audio, cover art, script, and source metadata. Publishing belongs behind a podcast-host/RSS adapter and a manual review step. For now: make the episode, give it a listen, then decide where it should go.
