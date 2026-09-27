@@ -9,7 +9,7 @@ import OpenAI from "openai";
 import sharp from "sharp";
 import { causeDetails, errorDetails, loggedStage, logger } from "./logger.js";
 import { listRuns, saveRun } from "./store.js";
-import type { Article, NewsletterIssue, PodcastScript, Run, SourceId } from "./types.js";
+import type { Article, NewsletterIssue, PodcastScript, Run, RunSource, SourceId } from "./types.js";
 
 const artifactDir = path.resolve(process.env.DATA_DIR ?? "./data", "artifacts");
 const execFileAsync = promisify(execFile);
@@ -22,6 +22,21 @@ const openai = process.env.OPENAI_API_KEY ? new OpenAI({
 const defaults: Record<SourceId, string> = {
   "javascript-weekly": "https://javascriptweekly.com/",
   "this-week-in-react": "https://thisweekinreact.com/newsletter"
+};
+
+const storyStopWords = new Set("a an and are as at by for from in into is it of on or the their this to with".split(" "));
+const configuredMinimumScriptWords = Number(process.env.MIN_SCRIPT_WORDS ?? 2250);
+const minimumScriptWords = Number.isFinite(configuredMinimumScriptWords) && configuredMinimumScriptWords > 0
+  ? Math.round(configuredMinimumScriptWords)
+  : 2250;
+
+export type StoryGroup = {
+  id: string;
+  title: string;
+  summary: string;
+  urls: string[];
+  sources: SourceId[];
+  occurrences: number;
 };
 
 function hash(value: string): string {
@@ -43,10 +58,88 @@ function clean(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function storyTitleKey(value: string): string {
+  return clean(value)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word && !storyStopWords.has(word) && !/^\d+$/.test(word))
+    .join(" ");
+}
+
+function storyTitleSimilarity(left: string, right: string): number {
+  const leftWords = new Set(storyTitleKey(left).split(" ").filter(Boolean));
+  const rightWords = new Set(storyTitleKey(right).split(" ").filter(Boolean));
+  if (!leftWords.size || !rightWords.size) return 0;
+  const intersection = [...leftWords].filter((word) => rightWords.has(word)).length;
+  return intersection / new Set([...leftWords, ...rightWords]).size;
+}
+
+function sameStory(left: Article, right: StoryGroup): boolean {
+  if (right.urls.some((url) => canonicalUrl(url) === canonicalUrl(left.url))) return true;
+  const similarity = storyTitleSimilarity(left.title, right.title);
+  return similarity >= 0.75 && Math.min(storyTitleKey(left.title).split(" ").length, storyTitleKey(right.title).split(" ").length) >= 3;
+}
+
+export function groupStories(issues: NewsletterIssue[]): StoryGroup[] {
+  const groups: StoryGroup[] = [];
+  for (const issue of issues) {
+    for (const article of issue.articles) {
+      const existing = groups.find((group) => sameStory(article, group));
+      if (existing) {
+        if (!existing.urls.some((url) => canonicalUrl(url) === canonicalUrl(article.url))) existing.urls.push(article.url);
+        if (!existing.sources.includes(issue.source)) existing.sources.push(issue.source);
+        existing.occurrences += 1;
+        if (article.summary.length > existing.summary.length) existing.summary = article.summary;
+        continue;
+      }
+      groups.push({
+        id: `story-${groups.length + 1}`,
+        title: article.title,
+        summary: article.summary,
+        urls: [article.url],
+        sources: [issue.source],
+        occurrences: 1
+      });
+    }
+  }
+  return groups;
+}
+
+function parsePublicationDate(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const dateOnly = value.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,|\s)\s*(\d{4})$/);
+  if (dateOnly) {
+    const month = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].indexOf(dateOnly[1]);
+    return new Date(Date.UTC(Number(dateOnly[3]), month, Number(dateOnly[2])));
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? undefined : parsed;
+}
+
 function resolveUrl(source: SourceId, requestedUrl?: string, issueNumber?: string): string {
   if (requestedUrl) return requestedUrl;
   if (source === "javascript-weekly" && issueNumber) return `https://javascriptweekly.com/issues/${issueNumber}`;
   return defaults[source];
+}
+
+function runArtifactDir(folderName: string): string {
+  return path.join(artifactDir, folderName);
+}
+
+function weekArtifactFolder(issues: NewsletterIssue[]): { folderName: string; label: string } {
+  const dates = issues
+    .map((issue) => issue.publishedAt ? new Date(issue.publishedAt) : undefined)
+    .filter((date): date is Date => Boolean(date && !Number.isNaN(date.valueOf())))
+    .sort((a, b) => a.valueOf() - b.valueOf());
+  const first = dates[0] ?? new Date();
+  const last = dates.at(-1) ?? first;
+  const sameMonthAndYear = first.getUTCMonth() === last.getUTCMonth() && first.getUTCFullYear() === last.getUTCFullYear();
+  const label = sameMonthAndYear
+    ? `week ${first.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" })} ${first.getUTCDate()}-${last.getUTCDate()}, ${last.getUTCFullYear()}`
+    : `week ${first.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })}-${last.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })}`;
+  return { label, folderName: label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") };
 }
 
 export async function fetchIssue(source: SourceId, requestedUrl?: string, issueNumber?: string): Promise<NewsletterIssue> {
@@ -58,8 +151,9 @@ export async function fetchIssue(source: SourceId, requestedUrl?: string, issueN
   const html = await response.text();
   const $ = cheerio.load(html);
   const title = clean($("h1").first().text() || $("title").text() || source);
-  const issueText = clean($("body").text()).match(/#(\d{2,4})/)?.[1] ?? issueNumber;
-  const publishedAt = clean($("time").first().attr("datetime") || $("time").first().text()) || undefined;
+  const issueText = url.match(/\/issues\/(\d+)/)?.[1] ?? url.match(/\/newsletter\/(\d+)/)?.[1] ?? clean($("body").text()).match(/#(\d{2,4})/)?.[1] ?? issueNumber;
+  const visibleDate = clean($("time").first().attr("datetime") || $("time").first().text()) || clean($("body").text()).match(/\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,|\s)\s*\d{4}\b/)?.[0];
+  const publishedAt = parsePublicationDate(visibleDate)?.toISOString();
   const articles: Article[] = [];
   const seen = new Set<string>();
   $(".mainlink a, p.desc a, h2 a, h3 a, article a").each((_, element) => {
@@ -90,10 +184,80 @@ function extractJson(text: string): string {
 export function renderPodcastNarration(script: PodcastScript): string {
   const opening = script.narration.trim();
   const segments = script.segments
-    .map((segment) => `${segment.title.trim()}\n\n${segment.narration.trim()}`)
+    .map(renderSegmentNarration)
     .filter(Boolean)
     .join("\n\n");
   return [opening, segments].filter(Boolean).join("\n\n");
+}
+
+function renderSegmentNarration(segment: PodcastScript["segments"][number]): string {
+  return [
+    segment.title.trim(),
+    segment.description.trim(),
+    segment.whyItMatters.trim() ? `Why it matters: ${segment.whyItMatters.trim()}` : "",
+    segment.followUps.trim() ? `Follow-ups: ${segment.followUps.trim()}` : "",
+    segment.narration.trim()
+  ].filter(Boolean).join("\n\n");
+}
+
+function spokenWordCount(script: PodcastScript): number {
+  return renderPodcastNarration(script).match(/\b[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)?\b/gu)?.length ?? 0;
+}
+
+function normalizeScript(value: PodcastScript, storyGroups: StoryGroup[]): PodcastScript {
+  const rawSegments = Array.isArray(value.segments) ? value.segments : [];
+  const seenGroups = new Set<string>();
+  const seenTitles: string[] = [];
+  const segments = rawSegments.map((segment) => {
+    const title = clean(String(segment.title ?? ""));
+    const sourceUrls = [...new Set([
+      ...(Array.isArray(segment.sourceUrls) ? segment.sourceUrls : []),
+      ...(segment.sourceUrl ? [String(segment.sourceUrl)] : [])
+    ].map(String).filter(Boolean))];
+    const matchingGroup = storyGroups.find((group) =>
+      (segment.storyId && group.id === segment.storyId) ||
+      sourceUrls.some((url) => group.urls.some((groupUrl) => canonicalUrl(groupUrl) === canonicalUrl(url))) ||
+      storyTitleSimilarity(title, group.title) >= 0.75
+    );
+    const storyId = matchingGroup?.id ?? segment.storyId;
+    const duplicate = storyId ? seenGroups.has(storyId) : seenTitles.some((seenTitle) => storyTitleSimilarity(seenTitle, title) >= 0.75);
+    if (duplicate) return undefined;
+    if (storyId) seenGroups.add(storyId);
+    seenTitles.push(title);
+    const resolvedUrls = matchingGroup?.urls ?? sourceUrls;
+    return {
+      storyId,
+      title,
+      sourceUrl: resolvedUrls[0] ?? "",
+      sourceUrls: resolvedUrls,
+      description: clean(String(segment.description ?? "")),
+      whyItMatters: clean(String(segment.whyItMatters ?? "")),
+      followUps: clean(String(segment.followUps ?? "")),
+      narration: clean(String(segment.narration ?? ""))
+    };
+  }).filter((segment): segment is NonNullable<typeof segment> => Boolean(segment?.title && segment.sourceUrl && segment.narration));
+  return {
+    title: clean(String(value.title ?? "")),
+    description: clean(String(value.description ?? "")),
+    narration: String(value.narration ?? "").trim(),
+    mainTopics: Array.isArray(value.mainTopics) ? value.mainTopics.map((topic) => clean(String(topic))).filter(Boolean) : undefined,
+    segments
+  };
+}
+
+export function renderPodcastDescription(script: PodcastScript, issues: NewsletterIssue[]): string {
+  const storyGroups = groupStories(issues);
+  const links = new Map<string, string>();
+  for (const segment of script.segments) {
+    const group = storyGroups.find((candidate) => candidate.id === segment.storyId || candidate.urls.some((url) => canonicalUrl(url) === canonicalUrl(segment.sourceUrl)));
+    const urls = group?.urls ?? segment.sourceUrls ?? [segment.sourceUrl];
+    for (const url of urls) {
+      const article = issues.flatMap((issue) => issue.articles).find((candidate) => canonicalUrl(candidate.url) === canonicalUrl(url));
+      links.set(canonicalUrl(url), `${article?.title ?? segment.title} — ${url}`);
+    }
+  }
+  const oneLineDescription = clean(script.description) || clean(script.title);
+  return [oneLineDescription, "", "Articles covered:", ...[...links.values()].map((link) => `- ${link}`), ""].join("\n");
 }
 
 function splitText(text: string, maxCharacters: number): string[] {
@@ -126,39 +290,62 @@ function splitText(text: string, maxCharacters: number): string[] {
 }
 
 export function speechChunks(script: PodcastScript, maxCharacters: number): string[] {
-  return [script.narration, ...script.segments.map((segment) => `${segment.title.trim()}\n\n${segment.narration.trim()}`)]
+  const addSentencePauses = (text: string): string => text.replace(/([.!?])\s+(?=[A-Z0-9])/g, "$1\n");
+  return [script.narration, ...script.segments.map(renderSegmentNarration)]
+    .map(addSentencePauses)
     .flatMap((text) => splitText(text, maxCharacters));
 }
 
-async function generateScript(issue: NewsletterIssue): Promise<PodcastScript> {
+async function generateScript(issues: NewsletterIssue[]): Promise<PodcastScript> {
   if (!openai) throw new Error("OPENAI_API_KEY is required to generate a script");
   const model = process.env.OPENAI_TEXT_MODEL ?? "gpt-5";
-  logger.info("script.requested", { model, articleCount: issue.articles.length, issueNumber: issue.issueNumber });
-  const input = `You are the editor and host of a concise weekly podcast for JavaScript and React developers.
-Create an original, flowing 8-12 minute episode from this newsletter issue. Select the strongest stories, explain why they matter, and use natural transitions. Do not invent facts or copy newsletter prose. Preserve source URLs in the JSON. Return JSON only with keys title, description, narration, segments; each segment has title, sourceUrl, narration.
+  const storyGroups = groupStories(issues);
+  logger.info("script.requested", { model, issueCount: issues.length, articleCount: issues.reduce((total, issue) => total + issue.articles.length, 0), distinctStoryCount: storyGroups.length, duplicateStoryCount: issues.reduce((total, issue) => total + issue.articles.length, 0) - storyGroups.length, minimumScriptWords });
+  const input = `You are the editor and host of a thoughtful weekly podcast for JavaScript and React developers.
+Create one original, flowing episode that is at least 15 minutes long when spoken at a measured pace. Aim for 2,400-2,800 spoken words and never return fewer than ${minimumScriptWords} spoken words. Cover 8-12 of the strongest distinct story groups below with enough context and analysis to make the episode useful, not padded. Use short sentences and put each sentence on its own line inside narration so the voice has natural pauses.
 
-Issue: ${JSON.stringify(issue)}`;
-  let response;
-  try {
-    response = await openai.responses.create({ model, input });
-  } catch (error) {
-    logger.error("script.openai.failed", { model, ...errorDetails(error), ...causeDetails(error) });
-    if (error instanceof OpenAI.APIConnectionError) {
-      const cause = error.cause instanceof Error ? `: ${error.cause.message}` : "";
-      throw new Error(`OpenAI connection failed${cause}. Check network, proxy, TLS, or firewall settings.`);
+The episode flow is mandatory:
+1. The opening narration must be an inviting intro that explicitly lists the main topics listeners will hear.
+2. Every segment must state the post's title, describe what it is about, explain why it is valuable to developers, and give concrete follow-ups or what to watch next. Use natural transitions between sections.
+3. End the final segment or narration with a light summary and sign-off.
+
+The input has already been grouped for duplicate detection. A story group with occurrences greater than one was covered by more than one newsletter. Mention that cross-newsletter signal once when useful, but create only one segment for that group. Never create two segments for the same group or repeat the same story under a different title. Do not treat each newsletter as a separate episode. Do not invent facts or copy newsletter prose. Preserve the supplied source URLs in sourceUrls.
+
+Return JSON only with keys title, description, mainTopics, narration, segments. description must be a one-sentence episode description. mainTopics must be a concise array of the topics named in the intro. Each segment must have storyId, title, sourceUrl, sourceUrls, description, whyItMatters, followUps, narration. sourceUrl must be the first URL in sourceUrls. The segment narration should be natural spoken detail that complements the three structured fields rather than repeating them verbatim.
+
+Story groups: ${JSON.stringify(storyGroups)}`;
+
+  const requestScript = async (requestInput: string): Promise<PodcastScript> => {
+    let response;
+    try {
+      response = await openai.responses.create({ model, input: requestInput });
+    } catch (error) {
+      logger.error("script.openai.failed", { model, ...errorDetails(error), ...causeDetails(error) });
+      if (error instanceof OpenAI.APIConnectionError) {
+        const cause = error.cause instanceof Error ? `: ${error.cause.message}` : "";
+        throw new Error(`OpenAI connection failed${cause}. Check network, proxy, TLS, or firewall settings.`);
+      }
+      if (error instanceof OpenAI.APIError) {
+        throw new Error(`OpenAI API failed (${error.status ?? "unknown status"}): ${error.message}`);
+      }
+      throw error;
     }
-    if (error instanceof OpenAI.APIError) {
-      throw new Error(`OpenAI API failed (${error.status ?? "unknown status"}): ${error.message}`);
-    }
-    throw error;
+    return normalizeScript(JSON.parse(extractJson(response.output_text)) as PodcastScript, storyGroups);
+  };
+
+  let script = await requestScript(input);
+  let wordCount = spokenWordCount(script);
+  if (wordCount < minimumScriptWords) {
+    logger.warn("script.too-short", { model, wordCount, minimumScriptWords });
+    script = await requestScript(`${input}\n\nThe previous draft was only ${wordCount} spoken words after duplicate removal. Expand the section explanations, developer value, examples, and follow-ups while keeping the exact one-segment-per-story-group rule. Return a complete replacement JSON document, not an outline.`);
+    wordCount = spokenWordCount(script);
   }
-  const script = JSON.parse(extractJson(response.output_text)) as PodcastScript;
-  const renderedNarration = renderPodcastNarration(script);
-  logger.info("script.generated", { model, title: script.title, segmentCount: script.segments.length, openingCharacters: script.narration.length, renderedNarrationCharacters: renderedNarration.length });
+  if (wordCount < minimumScriptWords) throw new Error(`Generated script is too short (${wordCount} spoken words; minimum is ${minimumScriptWords}). Try again or lower MIN_SCRIPT_WORDS intentionally.`);
+  logger.info("script.generated", { model, title: script.title, segmentCount: script.segments.length, wordCount, openingCharacters: script.narration.length, renderedNarrationCharacters: renderPodcastNarration(script).length });
   return script;
 }
 
-async function generateAudio(runId: string, script: PodcastScript): Promise<string> {
+async function generateAudio(runId: string, folderName: string, script: PodcastScript): Promise<string> {
   const apiKey = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   if (!apiKey || !voiceId) throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required to generate audio");
@@ -166,10 +353,14 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
   const model = configuredModel ?? "eleven_multilingual_v2";
   const modelLimit = speechModelLimits[model] ?? 10000;
   const maxChunkCharacters = Math.max(1000, modelLimit - 500);
+  const configuredSpeed = Number(process.env.ELEVENLABS_SPEED ?? "0.9");
+  const speed = Number.isFinite(configuredSpeed) ? Math.min(1.1, Math.max(0.7, configuredSpeed)) : 0.9;
+  const configuredGap = Number(process.env.ELEVENLABS_CHUNK_GAP_SECONDS ?? "0.45");
+  const chunkGapSeconds = Number.isFinite(configuredGap) ? Math.min(2, Math.max(0, configuredGap)) : 0.45;
   const chunks = speechChunks(script, maxChunkCharacters);
   const temporaryDir = await mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "web-platform-weekly-audio-"));
   const chunkPaths: string[] = [];
-  logger.info("audio.requested", { runId, provider: "elevenlabs", model, voiceConfigured: Boolean(voiceId), narrationCharacters: renderPodcastNarration(script).length, segmentCount: script.segments.length, chunkCount: chunks.length, maxChunkCharacters });
+  logger.info("audio.requested", { runId, provider: "elevenlabs", model, speed, chunkGapSeconds, voiceConfigured: Boolean(voiceId), narrationCharacters: renderPodcastNarration(script).length, segmentCount: script.segments.length, chunkCount: chunks.length, maxChunkCharacters });
   try {
     for (const [index, text] of chunks.entries()) {
       const previousText = chunks[index - 1]?.slice(-500);
@@ -178,7 +369,13 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
         method: "POST",
         headers: { "xi-api-key": apiKey, "content-type": "application/json" },
-        body: JSON.stringify({ text, model_id: model, previous_text: previousText, next_text: nextText })
+        body: JSON.stringify({
+          text,
+          model_id: model,
+          previous_text: previousText,
+          next_text: nextText,
+          voice_settings: { speed }
+        })
       });
       logger.info("audio.chunk.responded", { runId, chunkIndex: index, chunkCount: chunks.length, provider: "elevenlabs", status: response.status, contentType: response.headers.get("content-type") });
       if (!response.ok) {
@@ -200,9 +397,23 @@ async function generateAudio(runId: string, script: PodcastScript): Promise<stri
       logger.info("audio.chunk.saved", { runId, chunkIndex: index, chunkCount: chunks.length, bytes: audio.byteLength });
     }
     const concatList = path.join(temporaryDir, "concat.txt");
-    await writeFile(concatList, chunkPaths.map((chunkPath) => `file '${chunkPath.replaceAll("'", "'\\''")}'`).join("\n"));
-    const filePath = path.join(artifactDir, `${runId}.mp3`);
-    await execFileAsync(process.env.FFMPEG_PATH ?? "ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatList, "-ar", "44100", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "128k", filePath]);
+    const ffmpegPath = process.env.FFMPEG_PATH ?? "ffmpeg";
+    const concatEntries = chunkPaths.map((chunkPath) => `file '${chunkPath.replaceAll("'", "'\\''")}'`);
+    if (chunkGapSeconds > 0 && chunkPaths.length > 1) {
+      const silencePath = path.join(temporaryDir, "chunk-gap.mp3");
+      await execFileAsync(ffmpegPath, ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", String(chunkGapSeconds), "-q:a", "9", silencePath]);
+      const silenceEntry = `file '${silencePath.replaceAll("'", "'\\''")}'`;
+      const entriesWithGaps: string[] = [];
+      for (const [index, entry] of concatEntries.entries()) {
+        entriesWithGaps.push(entry);
+        if (index < concatEntries.length - 1) entriesWithGaps.push(silenceEntry);
+      }
+      await writeFile(concatList, entriesWithGaps.join("\n"));
+    } else {
+      await writeFile(concatList, concatEntries.join("\n"));
+    }
+    const filePath = path.join(runArtifactDir(folderName), "audio", "audio.mp3");
+    await execFileAsync(ffmpegPath, ["-y", "-f", "concat", "-safe", "0", "-i", concatList, "-ar", "44100", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "128k", filePath]);
     logger.info("audio.saved", { runId, filePath, chunkCount: chunks.length });
     return filePath;
   } finally {
@@ -230,49 +441,75 @@ export function selectElevenLabsModel(configuredModel: string | undefined, narra
   return requestedModel;
 }
 
-async function generateCover(runId: string, issue: NewsletterIssue): Promise<string> {
+function extractCoverKeywords(script: PodcastScript): string {
+  const text = `${script.title} ${script.description} ${script.narration} ${script.segments.map((segment) => `${segment.title} ${segment.narration}`).join(" ")}`.toLowerCase();
+  const stopWords = new Set("about after again against all also and are been being between both but can create from have into its more most other our over should that their these they this through using were what when where which with would your".split(" "));
+  const words = text.match(/[a-z][a-z-]{4,}/g) ?? [];
+  const counts = new Map<string, number>();
+  for (const word of words) if (!stopWords.has(word)) counts.set(word, (counts.get(word) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([word]) => word).join(", ") || "web platform, developer tools, software architecture";
+}
+
+async function generateCover(runId: string, folderName: string, script: PodcastScript): Promise<string> {
   if (!openai) throw new Error("OPENAI_API_KEY is required to generate cover art");
   const model = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-2.5-flare";
-  const headlineList = issue.articles.slice(0, 8).map((article) => article.title).join("; ");
-  logger.info("cover.requested", { runId, model, headlineCount: Math.min(issue.articles.length, 8) });
+  const keywords = extractCoverKeywords(script);
+  logger.info("cover.requested", { runId, model, keywords });
   const result = await openai.images.generate({
     model,
-    prompt: `Square editorial podcast cover art about JavaScript, React, web engineering, and developer tools. Use an energetic modern illustration with browser windows, component graphs, and signal waves. No words, letters, logos, or brand marks. Themes from this week's headlines: ${headlineList}`,
+    prompt: `Square podcast cover art inspired by these script keywords: ${keywords}. Stylized architectural illustration, mid-century editorial aesthetic, cinematic golden-hour lighting, semi-realistic digital painting. Evoke interconnected web platforms, software systems, and ideas through an elegant architectural scene. No words, letters, logos, or brand marks.`,
     size: "1024x1024",
     output_format: "png"
   });
   const encoded = result.data?.[0]?.b64_json;
   if (!encoded) throw new Error("OpenAI returned no cover image");
-  const label = `<svg width="1024" height="1024"><style>text{font-family:Arial,sans-serif;fill:white} .small{font-size:34px;font-weight:bold;letter-spacing:4px} .large{font-size:74px;font-weight:800}</style><text x="64" y="860" class="small">THE WEB PLATFORM WEEKLY</text><text x="64" y="940" class="large">${escapeXml(issue.issueNumber ? `ISSUE ${issue.issueNumber}` : "WEEKLY")}</text></svg>`;
-  const filePath = path.join(artifactDir, `${runId}.png`);
-  await sharp(Buffer.from(encoded, "base64")).composite([{ input: Buffer.from(label), blend: "over" }]).png().toFile(filePath);
+  const filePath = path.join(runArtifactDir(folderName), "cover-art", "cover.png");
+  await sharp(Buffer.from(encoded, "base64")).png().toFile(filePath);
   logger.info("cover.saved", { runId, filePath, model });
   return filePath;
 }
 
-function escapeXml(value: string): string {
-  return value.replace(/[<>&'\"]/g, (character) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[character] ?? character));
-}
-
-export async function executeRun(input: { source: SourceId; requestedUrl?: string; issueNumber?: string; bypass?: boolean }): Promise<Run> {
+export async function executeRun(input: { source: RunSource; requestedUrl?: string; requestedUrls?: string[]; requestedUrlsBySource?: Partial<Record<SourceId, string[]>>; issueNumber?: string; bypass?: boolean }): Promise<Run> {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const run: Run = { id, source: input.source, requestedUrl: input.requestedUrl, requestedIssueNumber: input.issueNumber, bypass: input.bypass === true, status: "running", createdAt: now, updatedAt: now };
+  const sources: SourceId[] = input.source === "both" ? ["javascript-weekly", "this-week-in-react"] : [input.source];
+  const requestedUrls = input.requestedUrls?.length ? input.requestedUrls : input.requestedUrl ? [input.requestedUrl] : undefined;
+  const runRequestedUrls = sources.flatMap((source, index) => input.requestedUrlsBySource?.[source] ?? (sources.length === 1 ? requestedUrls ?? [] : requestedUrls?.[index] ? [requestedUrls[index]] : []));
+  const run: Run = { id, source: input.source, requestedUrl: runRequestedUrls[0] ?? requestedUrls?.[0], requestedUrls: runRequestedUrls.length ? runRequestedUrls : undefined, requestedIssueNumber: input.issueNumber, bypass: input.bypass === true, status: "running", createdAt: now, updatedAt: now };
   const runStartedAt = Date.now();
-  logger.info("run.started", { runId: id, source: input.source, requestedUrl: input.requestedUrl, issueNumber: input.issueNumber, bypass: run.bypass });
+  logger.info("run.started", { runId: id, source: input.source, sources, requestedUrls: run.requestedUrls, issueNumber: input.issueNumber, bypass: run.bypass });
   await saveRun(run);
   try {
     await loggedStage(id, "artifact-directory", () => mkdir(artifactDir, { recursive: true }));
-    const issue = await loggedStage(id, "fetch-and-parse-issue", () => fetchIssue(input.source, input.requestedUrl, input.issueNumber), { source: input.source });
-    run.issue = issue;
+    const issueRequests = sources.flatMap((source, index) => {
+      const sourceUrls = input.requestedUrlsBySource?.[source];
+      if (sourceUrls?.length) return sourceUrls.map((url) => ({ source, url }));
+      if (sources.length === 1 && requestedUrls?.length) return requestedUrls.map((url) => ({ source, url }));
+      if (sources.length > 1 && requestedUrls?.[index]) return [{ source, url: requestedUrls[index] }];
+      return [{ source, url: resolveUrl(source, undefined, source === "javascript-weekly" ? input.issueNumber : undefined) }];
+    });
+    const issues = await loggedStage(id, "fetch-and-parse-issues", async () => Promise.all(issueRequests.map(({ source, url }) => fetchIssue(source, url))), { source: input.source, sourceCount: sources.length, urlCount: issueRequests.length });
+    run.issues = issues;
+    run.issue = issues[0];
+    const week = weekArtifactFolder(issues);
+    run.artifactFolder = week.folderName;
+    run.weekLabel = week.label;
+    await mkdir(runArtifactDir(week.folderName), { recursive: true });
+    await Promise.all(["script", "sources", "audio", "cover-art"].map((folder) => mkdir(path.join(runArtifactDir(week.folderName), folder), { recursive: true })));
     const previous = await loggedStage(id, "duplicate-check", () => listRuns(), { bypass: run.bypass });
-    const duplicate = previous.find((item) => item.id !== id && item.status === "completed" && item.issue?.contentHash === issue.contentHash);
+    const contentHashes = new Set(issues.map((issue) => issue.contentHash));
+    const duplicate = previous.find((item) => item.id !== id && item.status === "completed" && (item.issues ?? (item.issue ? [item.issue] : [])).length === issues.length && (item.issues ?? (item.issue ? [item.issue] : [])).every((issue) => contentHashes.has(issue.contentHash)));
     logger.info("duplicate-check.completed", { runId: id, bypass: run.bypass, duplicateFound: Boolean(duplicate), duplicateRunId: duplicate?.id });
     if (duplicate && !run.bypass) throw new Error(`This issue was already processed in run ${duplicate.id}. Re-run with bypass enabled for testing.`);
-    const script = await loggedStage(id, "script-generation", () => generateScript(issue), { source: input.source });
+    const script = await loggedStage(id, "script-generation", () => generateScript(issues), { source: input.source, issueCount: issues.length });
     run.script = script;
-    run.audioPath = await loggedStage(id, "audio-generation", () => generateAudio(id, script));
-    run.coverPath = await loggedStage(id, "cover-generation", () => generateCover(id, issue));
+    await writeFile(path.join(runArtifactDir(week.folderName), "script", "script.json"), JSON.stringify(script, null, 2));
+    await writeFile(path.join(runArtifactDir(week.folderName), "script", "narration.txt"), renderPodcastNarration(script));
+    await writeFile(path.join(runArtifactDir(week.folderName), "sources", "sources.json"), JSON.stringify(issues, null, 2));
+    await writeFile(path.join(runArtifactDir(week.folderName), "podcast-title.txt"), `${script.title.trim()}\n`);
+    await writeFile(path.join(runArtifactDir(week.folderName), "description.txt"), renderPodcastDescription(script, issues));
+    run.audioPath = await loggedStage(id, "audio-generation", () => generateAudio(id, week.folderName, script));
+    run.coverPath = await loggedStage(id, "cover-generation", () => generateCover(id, week.folderName, script));
     run.status = "completed";
     run.updatedAt = new Date().toISOString();
     await saveRun(run);

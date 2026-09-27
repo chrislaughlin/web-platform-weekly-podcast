@@ -1,4 +1,5 @@
 export type SourceId = "javascript-weekly" | "this-week-in-react";
+export type RunSource = SourceId | "both";
 
 export type Article = {
   title: string;
@@ -22,17 +23,31 @@ export type PodcastScript = {
   title: string;
   description: string;
   narration: string;
-  segments: Array<{ title: string; sourceUrl: string; narration: string }>;
+  mainTopics?: string[];
+  segments: Array<{
+    storyId?: string;
+    title: string;
+    sourceUrl: string;
+    sourceUrls?: string[];
+    description: string;
+    whyItMatters: string;
+    followUps: string;
+    narration: string;
+  }>;
 };
 
 export type Run = {
   id: string;
-  source: SourceId;
+  source: RunSource;
   requestedUrl?: string;
+  requestedUrls?: string[];
   requestedIssueNumber?: string;
+  artifactFolder?: string;
+  weekLabel?: string;
   bypass: boolean;
   status: "running" | "completed" | "failed";
   issue?: NewsletterIssue;
+  issues?: NewsletterIssue[];
   script?: PodcastScript;
   audioPath?: string;
   coverPath?: string;
