@@ -55,3 +55,19 @@ export type Run = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type GeneratedEpisode = {
+  id: string;
+  source: RunSource;
+  issueContentHashes: string[];
+  issueUrls: string[];
+  issueNumbers: string[];
+  title: string;
+  artifactFolder: string;
+  generatedAt: string;
+};
+
+export type GeneratedEpisodesFile = {
+  version: 1;
+  episodes: GeneratedEpisode[];
+};

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import * as cheerio from "cheerio";
@@ -9,9 +9,10 @@ import OpenAI from "openai";
 import sharp from "sharp";
 import { causeDetails, errorDetails, loggedStage, logger } from "./logger.js";
 import { listRuns, saveRun } from "./store.js";
-import type { Article, NewsletterIssue, PodcastScript, Run, RunSource, SourceId } from "./types.js";
+import type { Article, GeneratedEpisode, GeneratedEpisodesFile, NewsletterIssue, PodcastScript, Run, RunSource, SourceId } from "./types.js";
 
 const artifactDir = path.resolve(process.env.DATA_DIR ?? "./data", "artifacts");
+const generatedEpisodesPath = path.resolve(process.env.GENERATED_EPISODES_PATH ?? "./generated-episodes.json");
 const execFileAsync = promisify(execFile);
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -105,6 +106,42 @@ export function groupStories(issues: NewsletterIssue[]): StoryGroup[] {
     }
   }
   return groups;
+}
+
+async function readGeneratedEpisodes(): Promise<GeneratedEpisode[]> {
+  try {
+    const parsed = JSON.parse(await readFile(generatedEpisodesPath, "utf8")) as GeneratedEpisodesFile | GeneratedEpisode[];
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed?.version === 1 && Array.isArray(parsed.episodes)) return parsed.episodes;
+    throw new Error(`Invalid generated episode manifest: ${generatedEpisodesPath}`);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+function issueContentHashKey(issues: NewsletterIssue[]): string {
+  return issues.map((issue) => issue.contentHash).sort().join("|");
+}
+
+function generatedEpisodeMatchesIssues(episode: GeneratedEpisode, issues: NewsletterIssue[]): boolean {
+  return episode.issueContentHashes.length === issues.length && episode.issueContentHashes.slice().sort().join("|") === issueContentHashKey(issues);
+}
+
+async function recordGeneratedEpisode(run: Run, issues: NewsletterIssue[], script: PodcastScript): Promise<void> {
+  const episodes = await readGeneratedEpisodes();
+  const entry: GeneratedEpisode = {
+    id: run.id,
+    source: run.source,
+    issueContentHashes: issues.map((issue) => issue.contentHash),
+    issueUrls: issues.map((issue) => issue.url),
+    issueNumbers: issues.map((issue) => issue.issueNumber).filter((issueNumber): issueNumber is string => Boolean(issueNumber)),
+    title: script.title,
+    artifactFolder: run.artifactFolder ?? "",
+    generatedAt: run.updatedAt
+  };
+  const document: GeneratedEpisodesFile = { version: 1, episodes: [entry, ...episodes] };
+  await writeFile(generatedEpisodesPath, `${JSON.stringify(document, null, 2)}\n`);
 }
 
 function parsePublicationDate(value: string | undefined): Date | undefined {
@@ -450,22 +487,50 @@ function extractCoverKeywords(script: PodcastScript): string {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([word]) => word).join(", ") || "web platform, developer tools, software architecture";
 }
 
+async function applyDotsStyle(image: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(image).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const spacing = 8;
+  const circles: string[] = [];
+
+  for (let y = Math.floor(spacing / 2); y < info.height; y += spacing) {
+    for (let x = Math.floor(spacing / 2); x < info.width; x += spacing) {
+      const offset = (y * info.width + x) * info.channels;
+      const red = data[offset];
+      const green = data[offset + 1];
+      const blue = data[offset + 2];
+      const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+      const radius = 0.75 + luminance * 2.35;
+      const opacity = 0.28 + luminance * 0.65;
+      circles.push(`<circle cx="${x}" cy="${y}" r="${radius.toFixed(2)}" fill="rgb(${red},${green},${blue})" opacity="${opacity.toFixed(2)}"/>`);
+    }
+  }
+
+  const dots = Buffer.from(`<svg width="${info.width}" height="${info.height}" viewBox="0 0 ${info.width} ${info.height}" xmlns="http://www.w3.org/2000/svg">${circles.join("")}</svg>`);
+  return sharp(image)
+    .modulate({ saturation: 0.92 })
+    .composite([{ input: dots, blend: "over" }])
+    .png()
+    .toBuffer();
+}
+
 async function generateCover(runId: string, folderName: string, script: PodcastScript): Promise<string> {
   if (!openai) throw new Error("OPENAI_API_KEY is required to generate cover art");
   const model = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-2.5-flare";
   const keywords = extractCoverKeywords(script);
   logger.info("cover.requested", { runId, model, keywords });
+  const basePrompt = `Square podcast cover art inspired by these script keywords: ${keywords}. Stylized architectural illustration, mid-century editorial aesthetic, cinematic golden-hour lighting, semi-realistic digital painting. Evoke interconnected web platforms, software systems, and ideas through an elegant architectural scene. No words, letters, logos, or brand marks.`;
   const result = await openai.images.generate({
     model,
-    prompt: `Square podcast cover art inspired by these script keywords: ${keywords}. Stylized architectural illustration, mid-century editorial aesthetic, cinematic golden-hour lighting, semi-realistic digital painting. Evoke interconnected web platforms, software systems, and ideas through an elegant architectural scene. No words, letters, logos, or brand marks.`,
+    prompt: `${basePrompt} Generate the clean base artwork first; a separate post-processing pass will apply the final ASCII Magic-inspired dots treatment, so do not render a dot pattern yourself. Keep broad tonal shapes and architectural silhouettes clear enough to remain legible through that treatment.`,
     size: "1024x1024",
     output_format: "png"
   });
   const encoded = result.data?.[0]?.b64_json;
   if (!encoded) throw new Error("OpenAI returned no cover image");
   const filePath = path.join(runArtifactDir(folderName), "cover-art", "cover.png");
-  await sharp(Buffer.from(encoded, "base64")).png().toFile(filePath);
-  logger.info("cover.saved", { runId, filePath, model });
+  const styled = await applyDotsStyle(Buffer.from(encoded, "base64"));
+  await writeFile(filePath, styled);
+  logger.info("cover.saved", { runId, filePath, model, style: "dots" });
   return filePath;
 }
 
@@ -496,11 +561,14 @@ export async function executeRun(input: { source: RunSource; requestedUrl?: stri
     run.weekLabel = week.label;
     await mkdir(runArtifactDir(week.folderName), { recursive: true });
     await Promise.all(["script", "sources", "audio", "cover-art"].map((folder) => mkdir(path.join(runArtifactDir(week.folderName), folder), { recursive: true })));
+    const generatedEpisodes = await loggedStage(id, "generated-episode-check", readGeneratedEpisodes, { bypass: run.bypass, manifestPath: generatedEpisodesPath });
     const previous = await loggedStage(id, "duplicate-check", () => listRuns(), { bypass: run.bypass });
     const contentHashes = new Set(issues.map((issue) => issue.contentHash));
-    const duplicate = previous.find((item) => item.id !== id && item.status === "completed" && (item.issues ?? (item.issue ? [item.issue] : [])).length === issues.length && (item.issues ?? (item.issue ? [item.issue] : [])).every((issue) => contentHashes.has(issue.contentHash)));
-    logger.info("duplicate-check.completed", { runId: id, bypass: run.bypass, duplicateFound: Boolean(duplicate), duplicateRunId: duplicate?.id });
-    if (duplicate && !run.bypass) throw new Error(`This issue was already processed in run ${duplicate.id}. Re-run with bypass enabled for testing.`);
+    const manifestDuplicate = generatedEpisodes.find((episode) => episode.id !== id && generatedEpisodeMatchesIssues(episode, issues));
+    const runDuplicate = previous.find((item) => item.id !== id && item.status === "completed" && (item.issues ?? (item.issue ? [item.issue] : [])).length === issues.length && (item.issues ?? (item.issue ? [item.issue] : [])).every((issue) => contentHashes.has(issue.contentHash)));
+    const duplicateId = manifestDuplicate?.id ?? runDuplicate?.id;
+    logger.info("duplicate-check.completed", { runId: id, bypass: run.bypass, manifestPath: generatedEpisodesPath, manifestDuplicateFound: Boolean(manifestDuplicate), runHistoryDuplicateFound: Boolean(runDuplicate), duplicateRunId: duplicateId });
+    if (duplicateId && !run.bypass) throw new Error(`This issue was already processed in run ${duplicateId}. Re-run with bypass enabled for testing.`);
     const script = await loggedStage(id, "script-generation", () => generateScript(issues), { source: input.source, issueCount: issues.length });
     run.script = script;
     await writeFile(path.join(runArtifactDir(week.folderName), "script", "script.json"), JSON.stringify(script, null, 2));
@@ -512,6 +580,7 @@ export async function executeRun(input: { source: RunSource; requestedUrl?: stri
     run.coverPath = await loggedStage(id, "cover-generation", () => generateCover(id, week.folderName, script));
     run.status = "completed";
     run.updatedAt = new Date().toISOString();
+    await loggedStage(id, "generated-episode-record", () => recordGeneratedEpisode(run, issues, script), { manifestPath: generatedEpisodesPath });
     await saveRun(run);
     logger.info("run.completed", { runId: id, status: run.status, durationMs: Date.now() - runStartedAt, audioPath: run.audioPath, coverPath: run.coverPath });
     return run;

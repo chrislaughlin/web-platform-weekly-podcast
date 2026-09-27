@@ -18,6 +18,7 @@ The pipeline:
 - Generates measured MP3 narration with ElevenLabs, sentence line breaks, configurable voice speed, and short gaps between generated audio chunks.
 - Generates square cover art with OpenAI using keywords extracted from the finished script.
 - Saves a tidy, inspectable week-named folder under `data/artifacts/`: `script/`, `sources/`, `audio/`, `cover-art/`, `podcast-title.txt`, and `description.txt` (one episode line followed by the covered article links).
+- Records completed generations in the committed `generated-episodes.json` manifest and checks issue content hashes against it before spending time on another generation.
 - Supports bypass runs with `bypass: true` or the CLI `--bypass` flag when you want to rerun the same ingredients.
 
 No mystery meat, no external database, no giant platform to wrestle: just articles in, audio out.
@@ -72,6 +73,8 @@ OpenAI transport settings:
 - `OPENAI_MAX_RETRIES` defaults to `1`.
 
 If a script run fails with an OpenAI connection error, inspect the `script.openai.failed` log event. It reports whether the failure was a timeout, DNS/TLS/transport error, or an API response error without printing the API key.
+
+`generated-episodes.json` is updated after a complete episode has finished. Commit and push that manifest update with the generated episode if future runs should be prevented on other machines too. Use `--bypass` only when intentionally regenerating the same issue.
 
 ## Bypass mode: second takes welcome
 
