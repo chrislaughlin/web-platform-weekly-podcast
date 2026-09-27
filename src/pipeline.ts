@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
 import sharp from "sharp";
+import { createBuzzsproutClient } from "./buzzsprout.js";
 import { causeDetails, errorDetails, loggedStage, logger } from "./logger.js";
 import { listRuns, saveRun } from "./store.js";
 import type { Article, GeneratedEpisode, GeneratedEpisodesFile, NewsletterIssue, PodcastScript, Run, RunSource, SourceId } from "./types.js";
@@ -555,7 +556,7 @@ async function generateCover(runId: string, folderName: string, script: PodcastS
   return filePath;
 }
 
-export async function executeRun(input: { source: RunSource; requestedUrl?: string; requestedUrls?: string[]; requestedUrlsBySource?: Partial<Record<SourceId, string[]>>; issueNumber?: string; bypass?: boolean }): Promise<Run> {
+export async function executeRun(input: { source: RunSource; requestedUrl?: string; requestedUrls?: string[]; requestedUrlsBySource?: Partial<Record<SourceId, string[]>>; issueNumber?: string; bypass?: boolean; publishToBuzzsprout?: boolean }): Promise<Run> {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const sources: SourceId[] = input.source === "both" ? ["javascript-weekly", "this-week-in-react"] : [input.source];
@@ -599,6 +600,15 @@ export async function executeRun(input: { source: RunSource; requestedUrl?: stri
     await writeFile(path.join(runArtifactDir(week.folderName), "description.txt"), renderPodcastDescription(script, issues));
     run.audioPath = await loggedStage(id, "audio-generation", () => generateAudio(id, week.folderName, script));
     run.coverPath = await loggedStage(id, "cover-generation", () => generateCover(id, week.folderName, script));
+    if (input.publishToBuzzsprout !== false) {
+      const buzzsprout = await loggedStage(id, "buzzsprout-publish", async () => {
+        const client = await createBuzzsproutClient();
+        return client.publishGeneratedEpisode(runArtifactDir(week.folderName));
+      }, { artifactFolder: runArtifactDir(week.folderName) });
+      logger.info("buzzsprout.published", { runId: id, episodeId: buzzsprout.episodeId, title: buzzsprout.title, skipped: buzzsprout.skipped });
+    } else {
+      logger.info("buzzsprout.skipped", { runId: id, reason: "--skip-upload" });
+    }
     run.status = "completed";
     run.updatedAt = new Date().toISOString();
     await loggedStage(id, "generated-episode-record", () => recordGeneratedEpisode(run, issues, script), { manifestPath: generatedEpisodesPath });

@@ -44,6 +44,8 @@ Required keys:
 - `ELEVENLABS_CHUNK_GAP_SECONDS`: optional silence inserted between generated audio chunks; defaults to `0.45`.
 - `FFMPEG_PATH`: optional FFmpeg executable path; defaults to `ffmpeg`. Audio is generated in chunks and joined locally to keep voice delivery consistent across longer episodes.
 - `MIN_SCRIPT_WORDS`: optional minimum spoken-word count; defaults to `2250`, which targets at least 15 minutes at a measured speaking pace.
+- `BUZZ_SPROUT_API_KEY`: required for the default post-generation upload and publish step.
+- `BUZZSPROUT_PODCAST_ID`: optional when the Buzzsprout account has exactly one podcast; required when it has more than one.
 
 Optional settings are documented in `.env.example`.
 
@@ -53,6 +55,12 @@ Optional settings are documented in `.env.example`.
 npm run run -- --source javascript-weekly --issue 803
 npm run run -- --source this-week-in-react --url https://thisweekinreact.com/newsletter/298
 npm run run -- --source both
+```
+
+Runs publish the generated episode to Buzzsprout by default. Use `--skip-upload` when you want to generate and review local artifacts without publishing:
+
+```bash
+npm run run -- --source both --skip-upload
 ```
 
 For `--source both`, repeated `--url` values are assigned in feed order: the first to JavaScript Weekly and the second to This Week in React. Omit them to use the latest issue from each feed.
