@@ -411,8 +411,8 @@ async function generateAudio(runId: string, folderName: string, script: PodcastS
   const model = configuredModel ?? "eleven_multilingual_v2";
   const modelLimit = speechModelLimits[model] ?? 10000;
   const maxChunkCharacters = Math.max(1000, modelLimit - 500);
-  const configuredSpeed = Number(process.env.ELEVENLABS_SPEED ?? "0.9");
-  const speed = Number.isFinite(configuredSpeed) ? Math.min(1.1, Math.max(0.7, configuredSpeed)) : 0.9;
+  const configuredSpeed = Number(process.env.ELEVENLABS_SPEED ?? "1.0");
+  const speed = Number.isFinite(configuredSpeed) ? Math.min(1.1, Math.max(0.7, configuredSpeed)) : 1.0;
   const configuredGap = Number(process.env.ELEVENLABS_CHUNK_GAP_SECONDS ?? "0.45");
   const chunkGapSeconds = Number.isFinite(configuredGap) ? Math.min(2, Math.max(0, configuredGap)) : 0.45;
   const chunks = speechChunks(script, maxChunkCharacters);

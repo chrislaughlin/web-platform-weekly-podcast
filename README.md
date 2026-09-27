@@ -40,7 +40,7 @@ Required keys:
 - `ELEVENLABS_API_KEY`: narration generation.
 - `ELEVENLABS_VOICE_ID`: the ElevenLabs voice to use.
 - `ELEVENLABS_MODEL`: optional voice model; defaults to `eleven_multilingual_v2`. Scripts over that model's 10,000-character limit automatically fall back to `eleven_flash_v2_5` unless you explicitly set a different model.
-- `ELEVENLABS_SPEED`: optional measured delivery speed from `0.7` to `1.1`; defaults to `0.9`.
+- `ELEVENLABS_SPEED`: optional measured delivery speed from `0.7` to `1.1`; defaults to `1.0`.
 - `ELEVENLABS_CHUNK_GAP_SECONDS`: optional silence inserted between generated audio chunks; defaults to `0.45`.
 - `FFMPEG_PATH`: optional FFmpeg executable path; defaults to `ffmpeg`. Audio is generated in chunks and joined locally to keep voice delivery consistent across longer episodes.
 - `MIN_SCRIPT_WORDS`: optional minimum spoken-word count; defaults to `2250`, which targets at least 15 minutes at a measured speaking pace.
