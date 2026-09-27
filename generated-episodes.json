@@ -2,6 +2,25 @@
   "version": 1,
   "episodes": [
     {
+      "id": "13b72661-99c9-44bb-aecf-eb1e428742d0",
+      "source": "both",
+      "issueContentHashes": [
+        "fbb72b0fd295d0c23ad569c33f2421f4dc1c904b6cda6339e3dc151ad5671572",
+        "e28526cc2bb8dac869e69f13083fa7308747224d2a004af2bcec39db2b5b1c44"
+      ],
+      "issueUrls": [
+        "https://javascriptweekly.com/issues/801",
+        "https://thisweekinreact.com/newsletter/297"
+      ],
+      "issueNumbers": [
+        "801",
+        "297"
+      ],
+      "title": "Chunks, Tests, Threads, and Transitions: Fresh JavaScript and React Insights",
+      "artifactFolder": "week-september-8-16-2026",
+      "generatedAt": "2026-09-27T15:52:35.613Z"
+    },
+    {
       "id": "14f7a64d-a210-4f79-b78d-1e01c7b5afaa",
       "source": "both",
       "issueContentHashes": [

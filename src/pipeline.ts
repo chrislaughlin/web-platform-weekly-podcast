@@ -241,6 +241,21 @@ function spokenWordCount(script: PodcastScript): number {
   return renderPodcastNarration(script).match(/\b[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)?\b/gu)?.length ?? 0;
 }
 
+function hasSpokenClosing(scriptNarration: string, finalNarration: string): boolean {
+  return /(thanks for listening|thank you for listening|until next time|signing off|goodbye|we(?:'|’)ll be back|we will be back|that(?:'|’)s all for this episode)/i.test(`${scriptNarration} ${finalNarration}`.slice(-1200));
+}
+
+function appendPodcastClosing(narration: string, mainTopics: string[] | undefined, segments: PodcastScript["segments"]): string {
+  const topics = (mainTopics?.length ? mainTopics : segments.slice(0, 3).map((segment) => segment.title)).slice(0, 3);
+  const topicSummary = topics.length === 1
+    ? topics[0]
+    : topics.length === 2
+      ? `${topics[0]} and ${topics[1]}`
+      : `${topics.slice(0, -1).join(", ")}, and ${topics.at(-1) ?? "the week’s strongest stories"}`;
+  const closing = `To wrap up, we covered ${topicSummary}. Thanks for listening to Web Platform Weekly. Until next time, keep building, keep testing, and keep the web moving forward.`;
+  return [narration.trim(), closing].filter(Boolean).join("\n\n");
+}
+
 function normalizeScript(value: PodcastScript, storyGroups: StoryGroup[]): PodcastScript {
   const rawSegments = Array.isArray(value.segments) ? value.segments : [];
   const seenGroups = new Set<string>();
@@ -273,11 +288,17 @@ function normalizeScript(value: PodcastScript, storyGroups: StoryGroup[]): Podca
       narration: clean(String(segment.narration ?? ""))
     };
   }).filter((segment): segment is NonNullable<typeof segment> => Boolean(segment?.title && segment.sourceUrl && segment.narration));
+  const narration = String(value.narration ?? "").trim();
+  const mainTopics = Array.isArray(value.mainTopics) ? value.mainTopics.map((topic) => clean(String(topic))).filter(Boolean) : undefined;
+  if (segments.length && !hasSpokenClosing(narration, segments.at(-1)?.narration ?? "")) {
+    const finalSegment = segments.at(-1);
+    if (finalSegment) finalSegment.narration = appendPodcastClosing(finalSegment.narration, mainTopics, segments);
+  }
   return {
     title: clean(String(value.title ?? "")),
     description: clean(String(value.description ?? "")),
-    narration: String(value.narration ?? "").trim(),
-    mainTopics: Array.isArray(value.mainTopics) ? value.mainTopics.map((topic) => clean(String(topic))).filter(Boolean) : undefined,
+    narration,
+    mainTopics,
     segments
   };
 }
@@ -344,7 +365,7 @@ Create one original, flowing episode that is at least 15 minutes long when spoke
 The episode flow is mandatory:
 1. The opening narration must be an inviting intro that explicitly lists the main topics listeners will hear.
 2. Every segment must state the post's title, describe what it is about, explain why it is valuable to developers, and give concrete follow-ups or what to watch next. Use natural transitions between sections.
-3. End the final segment or narration with a light summary and sign-off.
+3. End the final segment or narration with a light summary and an actual sign-off. The final sentence must contain the recap and farewell. Do not end with a promise such as "we'll summarize next" or "then a quick summary" without immediately delivering that summary and sign-off.
 
 The input has already been grouped for duplicate detection. A story group with occurrences greater than one was covered by more than one newsletter. Mention that cross-newsletter signal once when useful, but create only one segment for that group. Never create two segments for the same group or repeat the same story under a different title. Do not treat each newsletter as a separate episode. Do not invent facts or copy newsletter prose. Preserve the supplied source URLs in sourceUrls.
 
